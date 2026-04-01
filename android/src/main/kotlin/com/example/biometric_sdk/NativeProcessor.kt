@@ -5,7 +5,7 @@ object NativeProcessor  {
         System.loadLibrary("native-lib")
     }
 
-    // Ye external function C++ wale JNI function se connect hoga
+    // Existing method
     @JvmStatic
     external fun processFingerprint(
         imageBytes: ByteArray,
@@ -14,5 +14,22 @@ object NativeProcessor  {
         landmarks: FloatArray
     ): ByteArray?
 
+    // NEW: Calculate quality metrics (blur, brightness, centering, etc.)
+    @JvmStatic
+    external fun calculateQualityMetrics(
+        imageBytes: ByteArray,
+        width: Int,
+        height: Int,
+        landmarks: FloatArray,
+        handCenterX: Int,
+        handCenterY: Int
+    ): FloatArray?
 
+    // NEW: Simple motion blur detection
+    @JvmStatic
+    external fun detectMotionBlur(
+        imageBytes: ByteArray,
+        width: Int,
+        height: Int
+    ): Int
 }
