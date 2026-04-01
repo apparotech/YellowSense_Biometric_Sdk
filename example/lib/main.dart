@@ -60,7 +60,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // 🔥 COLOR SYSTEM (TOP PE ADD KARO)
     const primaryYellow = Color(0xFFFFC107);
     const lightYellow = Color(0xFFFFF8E1);
     const darkYellow = Color(0xFFFFA000);
@@ -142,7 +141,6 @@ class HandSelectionCard extends StatelessWidget {
     return Column(
       children: [
 
-        // Title
         const Text(
           'Select Capture Mode',
           style: TextStyle(
@@ -164,18 +162,15 @@ class HandSelectionCard extends StatelessWidget {
 
         const SizedBox(height: 20),
 
-        // Hand Diagram Row
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Left Hand
             _HandDiagram(
               label: 'Left Hand',
               isLeft: true,
               onCapture: onCapture,
             ),
-            // Right Hand
             _HandDiagram(
               label: 'Right Hand',
               isLeft: false,
@@ -188,7 +183,6 @@ class HandSelectionCard extends StatelessWidget {
         const Divider(),
         const SizedBox(height: 16),
 
-        // Quick Action Buttons
         const Text(
           'Quick Capture',
           style: TextStyle(
@@ -248,10 +242,9 @@ class _HandDiagram extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 🔥 COLOR SYSTEM (TOP PE ADD KARO)
-const primaryYellow = Color(0xFFFFC107);
-const lightYellow = Color(0xFFFFF8E1);
-const darkYellow = Color(0xFFFFA000);
+    const primaryYellow = Color(0xFFFFC107);
+    const lightYellow = Color(0xFFFFF8E1);
+    const darkYellow = Color(0xFFFFA000);
     final mode = isLeft ? 'LEFT_FOUR' : 'RIGHT_FOUR';
     final fingers = isLeft
         ? ['L4', 'L3', 'L2', 'L1']
@@ -270,7 +263,6 @@ const darkYellow = Color(0xFFFFA000);
           ),
           const SizedBox(height: 8),
 
-          // Hand Icon
           Container(
             width: 130,
             height: 160,
@@ -304,7 +296,6 @@ const darkYellow = Color(0xFFFFA000);
 
           const SizedBox(height: 8),
 
-          // Finger Labels
           Row(
             mainAxisSize: MainAxisSize.min,
             children: fingers.map((f) => Container(
@@ -329,7 +320,6 @@ const darkYellow = Color(0xFFFFA000);
 
           const SizedBox(height: 8),
 
-          // Capture Button
           ElevatedButton(
             onPressed: () => onCapture(mode),
             style: ElevatedButton.styleFrom(
@@ -371,10 +361,9 @@ class _QuickButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 🔥 COLOR SYSTEM (TOP PE ADD KARO)
-const primaryYellow = Color(0xFFFFC107);
-const lightYellow = Color(0xFFFFF8E1);
-const darkYellow = Color(0xFFFFA000);
+    const primaryYellow = Color(0xFFFFC107);
+    const lightYellow = Color(0xFFFFF8E1);
+    const darkYellow = Color(0xFFFFA000);
     return GestureDetector(
       onTap: () => onTap(mode),
       child: Container(
@@ -390,8 +379,7 @@ const darkYellow = Color(0xFFFFA000);
         ),
         child: Column(
           children: [
-            Icon(icon,
-                color: primaryYellow, size: 28),
+            Icon(icon, color: primaryYellow, size: 28),
             const SizedBox(height: 6),
             Text(
               label,
@@ -421,6 +409,8 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
 
   CameraController? _controller;
+  // FIX: stable frame counter — tracks consecutive validated frames
+  int _stableFrameCount = 0;
   bool _initialized = false;
   String _guidance = 'Camera starting...';
   bool _fingerDetected = false;
@@ -429,9 +419,37 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _capturing = false;
   String _processedBase64 = '';
   String _detectedFingers = '';
+  // FIX: track the actual first detected finger for SINGLE_FINGER labelling
+  String _firstDetectedFinger = '';
+  // FIX: track liveness from frame result
+  bool _livenessPassed = false;
 
   static const _channel = MethodChannel('biometric_sdk');
   Timer? _timer;
+
+  // ── fingersRequested for CUSTOM_SEQUENCE / PARTIAL_CAPTURE modes ─────────
+  // In a real integration these would be passed in from the caller.
+  // They are exposed here so the channel call can forward them to Kotlin.
+  List<String> get _fingersRequested {
+    switch (widget.mode) {
+      case 'LEFT_FOUR':
+        return ['LEFT_INDEX', 'LEFT_MIDDLE', 'LEFT_RING', 'LEFT_LITTLE'];
+      case 'RIGHT_FOUR':
+        return ['RIGHT_INDEX', 'RIGHT_MIDDLE', 'RIGHT_RING', 'RIGHT_LITTLE'];
+      case 'LEFT_THUMB':
+        return ['LEFT_THUMB'];
+      case 'RIGHT_THUMB':
+        return ['RIGHT_THUMB'];
+      case 'SINGLE_FINGER':
+        return [];
+      default:
+        return [];
+    }
+  }
+
+  // missingFingers is empty by default; would be set by the caller in
+  // PARTIAL_CAPTURE scenarios.
+  List<String> get _missingFingers => [];
 
   @override
   void initState() {
@@ -469,7 +487,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   void _startTimer() {
     _timer = Timer.periodic(
-      const Duration(seconds: 2),
+      const Duration(milliseconds: 800),
       (timer) async {
         if (_capturing || !_initialized) return;
         await _processFrame();
@@ -482,23 +500,42 @@ class _CameraScreenState extends State<CameraScreen> {
       final image = await _controller!.takePicture();
       final bytes = await image.readAsBytes();
 
+      // FIX: send fingersRequested and missingFingers so Kotlin can validate
+      // CUSTOM_SEQUENCE and PARTIAL_CAPTURE modes correctly.
       final result = await _channel.invokeMethod('processFrame', {
-        'frame': bytes,
+        'frame':            bytes,
+        'captureMode':      widget.mode,
+        'fingersRequested': _fingersRequested,
+        'missingFingers':   _missingFingers,
       });
 
       if (!mounted) return;
 
+      final bool liveness = result['livenessPassed'] as bool? ?? false;
+
       setState(() {
-        _fingerDetected = result['fingerDetected'] as bool? ?? false;
-        _guidance       = result['guidance'] as String? ?? '';
-        _qualityScore   = result['qualityScore'] as int? ?? 0;
-        _fingerCount    = result['fingerCount'] as int? ?? 0;
-        _processedBase64 = result['processedImage'] as String? ?? '';
-        _detectedFingers = result['detectedFingersName'] as String? ?? '';
+        _fingerDetected      = result['fingerDetected'] as bool? ?? false;
+        _guidance            = result['guidance'] as String? ?? '';
+        _qualityScore        = result['qualityScore'] as int? ?? 0;
+        _fingerCount         = result['fingerCount'] as int? ?? 0;
+        _processedBase64     = result['processedImage'] as String? ?? '';
+        _detectedFingers     = result['detectedFingersName'] as String? ?? '';
+        // FIX: store the actual first detected finger for SINGLE_FINGER
+        _firstDetectedFinger = result['firstDetectedFinger'] as String? ?? '';
+        _livenessPassed      = liveness;
       });
 
       final ready = result['readyToCapture'] as bool? ?? false;
-      if (ready && !_capturing) {
+
+      if (ready) {
+        _stableFrameCount++;
+      } else {
+        // FIX: always reset counter when a frame is NOT ready
+        _stableFrameCount = 0;
+      }
+
+      // Require 3 consecutive stable frames before triggering capture
+      if (_stableFrameCount >= 3 && !_capturing) {
         _timer?.cancel();
         await _capture(bytes);
       }
@@ -506,47 +543,6 @@ class _CameraScreenState extends State<CameraScreen> {
       print('Frame error: $e');
     }
   }
-
-  // Future<void> _capture([Uint8List? existingBytes]) async {
-  //   if (_capturing) return;
-  //   setState(() {
-  //     _capturing = true;
-  //     _guidance  = 'Processing...';
-  //   });
-  //   _timer?.cancel();
-
-  //   try {
-  //     Uint8List bytes;
-  //     if (existingBytes != null) {
-  //       bytes = existingBytes;
-  //     } else {
-  //       final image = await _controller!.takePicture();
-  //       bytes = await image.readAsBytes();
-  //     }
-
-  //     final result = await _channel.invokeMethod('startCapture', {
-  //       'captureMode': widget.mode,
-  //       'image': bytes,
-  //     });
-
-  //     if (mounted) {
-  //       Navigator.pop(context, 
-  //         'Status: ${result['overallStatus']}\n'
-  //         'Mode: ${result['captureMode']}\n'
-  //         'Fingers: ${(result['results'] as List).length}\n'
-  //         'Quality: $_qualityScore'
-  //       );
-  //     }
-  //   } catch (e) {
-  //     if (mounted) {
-  //       setState(() {
-  //         _capturing = false;
-  //         _guidance  = 'Please try again';
-  //       });
-  //       _startTimer();
-  //     }
-  //   }
-  // }
 
   Future<void> _capture([Uint8List? existingBytes]) async {
     if (_capturing) return;
@@ -565,13 +561,17 @@ class _CameraScreenState extends State<CameraScreen> {
         bytes = await image.readAsBytes();
       }
 
+      // FIX: forward actual quality and the real detected finger name to
+      // handleCapture so the result is not fabricated.
       final result = await _channel.invokeMethod('startCapture', {
-        'captureMode': widget.mode,
-        'image': bytes,
+        'captureMode':      widget.mode,
+        'image':            bytes,
+        'missingFingers':   _missingFingers,
+        'detectedFinger':   _firstDetectedFinger,
+        'qualityScore':     _qualityScore,
       });
 
       if (mounted) {
-        // ← Yeh change karo — Result Screen pe jaao
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
@@ -586,6 +586,9 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     } catch (e) {
       if (mounted) {
+        // FIX: reset stableFrameCount on error so we don't instantly
+        // re-trigger capture on the next timer tick.
+        _stableFrameCount = 0;
         setState(() {
           _capturing = false;
           _guidance  = 'Please try again';
@@ -593,7 +596,7 @@ class _CameraScreenState extends State<CameraScreen> {
         _startTimer();
       }
     }
-}
+  }
 
   @override
   void dispose() {
@@ -607,7 +610,7 @@ class _CameraScreenState extends State<CameraScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor:Color(0xFFFFC107),
+        backgroundColor: Color(0xFFFFC107),
         title: Text(
           widget.mode.replaceAll('_', ' '),
           style: const TextStyle(
@@ -626,7 +629,6 @@ class _CameraScreenState extends State<CameraScreen> {
             child: _initialized
                 ? Stack(
                     children: [
-                      // Camera
                       SizedBox.expand(
                         child: CameraPreview(_controller!),
                       ),
@@ -732,11 +734,10 @@ class _CameraScreenState extends State<CameraScreen> {
             padding: const EdgeInsets.all(16),
             child: Column(
               children: [
-                // 🚀 🔥 NAYA CODE: YAHAN PROCESSED IMAGE DIKHEGI 🔥 🚀
                 if (_processedBase64.isNotEmpty)
                   Container(
                     margin: const EdgeInsets.only(bottom: 12),
-                    height: 120, // Chhoti Preview Window
+                    height: 120,
                     width: 90,
                     decoration: BoxDecoration(
                       color: Colors.white,
@@ -748,7 +749,7 @@ class _CameraScreenState extends State<CameraScreen> {
                       child: Image.memory(
                         base64Decode(_processedBase64),
                         fit: BoxFit.cover,
-                        gaplessPlayback: true, // Camera frame par blink na ho
+                        gaplessPlayback: true,
                       ),
                     ),
                   ),
@@ -780,7 +781,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   Text(
                     'Detecting: $_detectedFingers',
                     style: const TextStyle(
-                      color: Colors.white70, // Thoda light color
+                      color: Colors.white70,
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
                     ),
@@ -788,8 +789,6 @@ class _CameraScreenState extends State<CameraScreen> {
                 ],
 
                 const SizedBox(height: 16),
-
-
               ],
             ),
           ),
@@ -823,8 +822,6 @@ class ResultScreen extends StatelessWidget {
     const primaryYellow = Color(0xFFFFC107);
     const lightYellow = Color(0xFFFFF8E1);
     const darkYellow = Color(0xFFFFA000);
-    
-  
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -845,7 +842,6 @@ class ResultScreen extends StatelessWidget {
         child: Column(
           children: [
 
-            // ── Success Icon ──────────────────────────────
             Container(
               width: 80,
               height: 80,
@@ -859,7 +855,7 @@ class ResultScreen extends StatelessWidget {
               ),
               child: const Icon(
                 Icons.check_circle,
-                color:primaryYellow,
+                color: primaryYellow,
                 size: 50,
               ),
             ),
@@ -891,7 +887,6 @@ class ResultScreen extends StatelessWidget {
 
             const SizedBox(height: 20),
 
-            // ── Captured Image ────────────────────────────
             ClipRRect(
               borderRadius: BorderRadius.circular(12),
               child: Image.memory(
@@ -904,7 +899,6 @@ class ResultScreen extends StatelessWidget {
 
             const SizedBox(height: 20),
 
-            // ── Quality Score ─────────────────────────────
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -959,7 +953,6 @@ class ResultScreen extends StatelessWidget {
 
             const SizedBox(height: 16),
 
-            // ── Transaction Info ──────────────────────────
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -993,7 +986,6 @@ class ResultScreen extends StatelessWidget {
 
             const SizedBox(height: 16),
 
-            // ── Finger Results ────────────────────────────
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -1056,16 +1048,14 @@ class ResultScreen extends StatelessWidget {
 
             const SizedBox(height: 24),
 
-            // ── Buttons ───────────────────────────────────
             Row(
               children: [
-                // Capture Again
                 Expanded(
                   child: OutlinedButton.icon(
                     onPressed: () => Navigator.pop(context),
                     icon: const Icon(
                       Icons.refresh,
-                      color:primaryYellow
+                      color: primaryYellow
                     ),
                     label: const Text(
                       'Capture Again',
@@ -1089,7 +1079,6 @@ class ResultScreen extends StatelessWidget {
 
                 const SizedBox(width: 12),
 
-                // Done
                 Expanded(
                   child: ElevatedButton.icon(
                     onPressed: () => Navigator.popUntil(
