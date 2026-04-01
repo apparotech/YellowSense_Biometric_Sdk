@@ -1,9 +1,9 @@
-
 package com.example.biometric_sdk
 
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.util.Base64
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -16,7 +16,9 @@ import io.flutter.plugin.common.MethodChannel.Result
 import java.util.UUID
 import android.graphics.Matrix
 import java.io.FileOutputStream
-
+import kotlin.math.abs
+import kotlin.math.sqrt
+import kotlin.math.pow
 
 class BiometricSdkPlugin : FlutterPlugin, MethodCallHandler {
 
@@ -24,358 +26,689 @@ class BiometricSdkPlugin : FlutterPlugin, MethodCallHandler {
     private lateinit var context: Context
     private var handLandmarker: HandLandmarker? = null
 
-    override fun onAttachedToEngine(
-        flutterPluginBinding: FlutterPlugin.FlutterPluginBinding
-    ) {
-        context = flutterPluginBinding.applicationContext
-        channel = MethodChannel(
-            flutterPluginBinding.binaryMessenger,
-            "biometric_sdk"
-        )
+    companion object {
+        private const val QUALITY_THRESHOLD_CAPTURE = 35  // minimum to allow capture
+        private const val QUALITY_THRESHOLD_GOOD    = 70  // "good quality" bar
+        private const val BLUR_THRESHOLD_MOTION     = 25  // below this = too blurry
+        private const val BRIGHTNESS_MIN            = 40  // minimum brightness score
+        private const val CENTERING_MIN             = 50  // minimum centering score
+        
+        // Quality weights (40% blur, 30% brightness, 30% centering)
+        private const val BLUR_WEIGHT = 0.40
+        private const val BRIGHTNESS_WEIGHT = 0.30
+        private const val CENTERING_WEIGHT = 0.30
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Engine lifecycle
+    // ─────────────────────────────────────────────────────────────────────────
+
+    override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        context = binding.applicationContext
+        channel = MethodChannel(binding.binaryMessenger, "biometric_sdk")
         channel.setMethodCallHandler(this)
         setupMediaPipe()
     }
 
-    // ── MediaPipe Setup ───────────────────────────────────────
-    private fun setupMediaPipe() {
-    try {
-        val baseOptions = BaseOptions.builder()
-            .setModelAssetPath("hand_landmarker.task")
-            .build()
-
-        val options = HandLandmarker.HandLandmarkerOptions.builder()
-            .setBaseOptions(baseOptions)
-            .setNumHands(2)                          // ← 1 se 2
-            .setMinHandDetectionConfidence(0.1f)     // ← 0.5 se 0.1
-            .setMinHandPresenceConfidence(0.1f)      // ← 0.5 se 0.1
-            .setMinTrackingConfidence(0.1f)          // ← 0.5 se 0.1
-            .build()
-
-        handLandmarker = HandLandmarker.createFromOptions(context, options)
-        
-        android.util.Log.d("BiometricSDK", 
-            "MediaPipe setup SUCCESS!")
-            
-    } catch (e: Exception) {
-        android.util.Log.e("BiometricSDK", 
-            "MediaPipe setup FAILED: ${e.message}")
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        handLandmarker?.close()
+        channel.setMethodCallHandler(null)
     }
-}
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MediaPipe setup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun setupMediaPipe() {
+        try {
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetPath("hand_landmarker.task")
+                .build()
+            val options = HandLandmarker.HandLandmarkerOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setNumHands(2)
+                .setMinHandDetectionConfidence(0.1f)
+                .setMinHandPresenceConfidence(0.1f)
+                .setMinTrackingConfidence(0.1f)
+                .build()
+            handLandmarker = HandLandmarker.createFromOptions(context, options)
+            android.util.Log.d("BiometricSDK", "MediaPipe setup SUCCESS!")
+        } catch (e: Exception) {
+            android.util.Log.e("BiometricSDK", "MediaPipe setup FAILED: ${e.message}")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Method channel router
+    // ─────────────────────────────────────────────────────────────────────────
 
     override fun onMethodCall(call: MethodCall, result: Result) {
         when (call.method) {
 
-            "getPlatformVersion" -> {
+            "getPlatformVersion" ->
                 result.success("Android ${android.os.Build.VERSION.RELEASE}")
-            }
 
-            // ── Process Frame — Real time ─────────────────────
             "processFrame" -> {
-                val imageBytes = call.argument<ByteArray>("frame")
+                val imageBytes      = call.argument<ByteArray>("frame")
+                val captureMode     = call.argument<String>("captureMode") ?: "SINGLE_FINGER"
+                val fingersRequested= call.argument<List<String>>("fingersRequested") ?: emptyList()
+                val missingFingers  = call.argument<List<String>>("missingFingers")   ?: emptyList()
+
                 if (imageBytes == null) {
-                    result.error("NO_FRAME", "Frame nahi mila", null)
+                    result.error("NO_FRAME", "Frame data not received", null)
                     return
                 }
-                android.util.Log.d("BiometricSDK", 
-                "Frame received: ${imageBytes.size} bytes")
-            android.util.Log.d("BiometricSDK", 
-                "HandLandmarker: $handLandmarker")
 
-                val frameResult = processFrame(imageBytes)
-                android.util.Log.d("BiometricSDK", 
-                "Result: $frameResult")
+                android.util.Log.d("BiometricSDK",
+                    "processFrame: ${imageBytes.size} bytes, mode=$captureMode")
+
+                val frameResult = processFrame(
+                    imageBytes, captureMode, fingersRequested, missingFingers
+                )
+
+                android.util.Log.d("BiometricSDK_CAPTURE",
+                    "readyToCapture=${frameResult["readyToCapture"]}, " +
+                    "quality=${frameResult["qualityScore"]}, " +
+                    "guidance=${frameResult["guidance"]}")
+
                 result.success(frameResult)
             }
 
-            // ── Final Capture ─────────────────────────────────
             "startCapture" -> {
-                val mode = call.argument<String>("captureMode") ?: "SINGLE_FINGER"
-                val imageBytes = call.argument<ByteArray>("image")
-                handleCapture(mode, imageBytes, result)
+                val mode           = call.argument<String>("captureMode")    ?: "SINGLE_FINGER"
+                val imageBytes     = call.argument<ByteArray>("image")
+                val missingFingers = call.argument<List<String>>("missingFingers") ?: emptyList()
+                val detectedFinger = call.argument<String>("detectedFinger") ?: ""
+                val actualQuality  = call.argument<Int>("qualityScore")      ?: 0
+
+                android.util.Log.d("BiometricSDK_CAPTURE",
+                    "startCapture — mode=$mode, quality=$actualQuality, finger=$detectedFinger")
+
+                handleCapture(mode, imageBytes, missingFingers, detectedFinger, actualQuality, result)
             }
 
             else -> result.notImplemented()
         }
     }
 
-   
-private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
-    return try {
+    // ─────────────────────────────────────────────────────────────────────────
+    // processFrame — real-time feedback per camera frame
+    // ─────────────────────────────────────────────────────────────────────────
 
-        var bitmap = BitmapFactory.decodeByteArray(
-            imageBytes, 0, imageBytes.size
-        )
+    private fun processFrame(
+        imageBytes: ByteArray,
+        captureMode: String,
+        fingersRequested: List<String>,
+        missingFingers: List<String>
+    ): Map<String, Any> {
+        return try {
 
-        if (bitmap == null) {
-            return mapOf(
-                "fingerDetected" to false,
-                "confidence"     to 0.0,
-                "guidance"       to "Image could not be loaded",
-                "qualityScore"   to 0,
-                "fingerCount"    to 0,
-                "readyToCapture" to false
+            // 1. Decode & rotate ──────────────────────────────────────────
+            var bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                ?: return noHandResult("Image could not be loaded", "Image decode failed")
+
+            bitmap = rotateBitmap(bitmap)
+            saveBitmapForDebug(bitmap)
+
+            android.util.Log.d("BiometricSDK",
+                "After rotate: ${bitmap.width}x${bitmap.height}")
+
+            // 2. MediaPipe hand detection ─────────────────────────────────
+            val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+            val mpImage = BitmapImageBuilder(argbBitmap).build()
+            val landmarkerResult = handLandmarker!!.detect(mpImage)
+
+            android.util.Log.d("BiometricSDK",
+                "Hands detected: ${landmarkerResult?.landmarks()?.size ?: 0}")
+
+            if (landmarkerResult == null || landmarkerResult.landmarks().isEmpty()) {
+                val qualityReport = assessAdvancedQualityFallback(bitmap)
+                return noHandResult(
+                    "Place your hand in front of the camera",
+                    "No hand detected",
+                    qualityReport
+                )
+            }
+
+            // 3. Pick the best hand for the requested capture mode ────────
+            //
+            // BACK CAMERA FIX: No mirror correction needed for back camera
+            // MediaPipe labels hands as they appear (no mirror flip)
+            //   "Left"  from MediaPipe → user's LEFT hand
+            //   "Right" from MediaPipe → user's RIGHT hand
+            //
+            // We use raw handedness directly for back camera.
+
+            val requiredHandedness = getRequiredHandedness(captureMode) // "Left" | "Right" | null
+
+            var selectedIdx = 0
+            if (requiredHandedness != null) {
+                for (i in landmarkerResult.landmarks().indices) {
+                    val raw = landmarkerResult.handednesses()[i][0].categoryName()
+                    // No mirror correction for back camera
+                    if (raw == requiredHandedness) {
+                        selectedIdx = i
+                        break
+                    }
+                }
+                // If the matching hand was not found, selectedIdx stays 0.
+                // validateCaptureMode will then catch the wrong-hand situation.
+            }
+
+            val landmarks   = landmarkerResult.landmarks()[selectedIdx]
+            val rawHandedness = landmarkerResult.handednesses()[selectedIdx][0].categoryName()
+            // No mirror correction for back camera
+            val correctedHandedness = rawHandedness
+
+            android.util.Log.d("BiometricSDK",
+                "Selected hand idx=$selectedIdx, handedness=$correctedHandedness")
+
+            // 4. Detect extended fingers ──────────────────────────────────
+            val allDetectedFingers = getDetectedFingers(landmarks, correctedHandedness)
+
+            android.util.Log.d("BiometricSDK",
+                "Detected fingers: $allDetectedFingers")
+
+            // 5. Quality assessment with C++ blur calculation ─────────────────────
+            val qualityReport   = assessAdvancedQuality(bitmap, landmarks)
+            val overallQuality  = qualityReport["overallScore"]   as Int
+            val blurScore       = qualityReport["blurScore"]      as? Int ?: 0
+            val brightnessScore = qualityReport["brightnessScore"]as? Int ?: 0
+            val centeringScore  = qualityReport["centeringScore"] as? Int ?: 0
+            val isBlurry        = blurScore < BLUR_THRESHOLD_MOTION
+
+            android.util.Log.d("BiometricSDK",
+                "Quality: overall=$overallQuality, blur=$blurScore, " +
+                "brightness=$brightnessScore, centering=$centeringScore")
+
+            // 6. Liveness ─────────────────────────────────────────────────
+            val (livenessPassed, livenessScore) = checkLiveness(landmarks, bitmap)
+
+            // 7. STRICT capture mode validation ───────────────────────────
+            val (isValid, validationMsg) = validateCaptureMode(
+                captureMode,
+                allDetectedFingers,
+                correctedHandedness,
+                fingersRequested,
+                missingFingers
             )
-        }
 
-        // ── Rotation Fix ──────────────────────────────────
-        // Portrait 480x640 → Rotate → 640x480
-        bitmap = rotateBitmap(bitmap)
-        saveBitmapForDebug(bitmap)
-
-        android.util.Log.d("BiometricSDK",
-            "After rotate: ${bitmap.width}x${bitmap.height}")
-
-        // Quality
-        val brightness = getBrightness(bitmap)
-        var quality = 50
-        if (bitmap.width >= 480) quality += 10
-        if (brightness in 60.0..220.0) quality += 20
-        quality = quality.coerceIn(0, 100)
-
-        // MediaPipe
-        val argbBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-        val mpImage = BitmapImageBuilder(argbBitmap).build()
-        val landmarkerResult = handLandmarker!!.detect(mpImage)
-
-        android.util.Log.d("BiometricSDK",
-            "Landmarks: ${landmarkerResult?.landmarks()?.size}")
-
-        if (landmarkerResult == null ||
-            landmarkerResult.landmarks().isEmpty()) {
-            return mapOf(
-                "fingerDetected" to false,
-                "confidence"     to 0.0,
-                "guidance"       to "Place your hand in front of camera",
-                "qualityScore"   to quality,
-                "fingerCount"    to 0,
-                "readyToCapture" to false
+            // 8. Guidance message ─────────────────────────────────────────
+            val guidance = buildGuidance(
+                isValid, validationMsg, livenessPassed,
+                overallQuality, isBlurry, brightnessScore, centeringScore,
+                captureMode, allDetectedFingers.size, landmarks, qualityReport
             )
+
+            // 9. readyToCapture — ALL gates must pass, NO relaxed bypass ──
+            //
+            //   a. Strict mode validation (isValid)
+            //   b. Quality >= capture threshold
+            //   c. Liveness passed
+            //
+            val readyToCapture = isValid &&
+                overallQuality >= QUALITY_THRESHOLD_CAPTURE &&
+                livenessPassed
+
+            android.util.Log.d("BiometricSDK_CAPTURE", """
+                === READINESS ===
+                captureMode     = $captureMode
+                isValid         = $isValid  [$validationMsg]
+                overallQuality  = $overallQuality (need >= $QUALITY_THRESHOLD_CAPTURE)
+                blurScore       = $blurScore (blurry if < $BLUR_THRESHOLD_MOTION)
+                liveness        = $livenessPassed
+                detectedFingers = $allDetectedFingers
+                readyToCapture  = $readyToCapture
+                guidance        = $guidance
+                =================
+            """.trimIndent())
+
+            // 10. Native processing (C++) ─────────────────────────────────
+            val points = FloatArray(42)
+            for (i in 0 until 21) {
+                points[i * 2]     = landmarks[i].x()
+                points[i * 2 + 1] = landmarks[i].y()
+            }
+
+            val processedBytes = NativeProcessor.processFingerprint(
+                imageBytes, bitmap.width, bitmap.height, points
+            )
+
+            val processedBase64 = if (processedBytes != null)
+                Base64.encodeToString(processedBytes, Base64.NO_WRAP) else ""
+
+            val confidence = (overallQuality / 100.0 * 0.7 + livenessScore * 0.3)
+                .coerceIn(0.0, 1.0)
+
+            mapOf(
+                "fingerDetected"      to allDetectedFingers.isNotEmpty(),
+                "confidence"          to confidence,
+                "guidance"            to guidance,
+                "qualityScore"        to overallQuality,
+                "qualityDetails"      to qualityReport,
+                "fingerCount"         to allDetectedFingers.size,
+                "detectedFingersName" to allDetectedFingers.joinToString(", "),
+                "firstDetectedFinger" to (allDetectedFingers.firstOrNull() ?: ""),
+                "processedImage"      to processedBase64,
+                "readyToCapture"      to readyToCapture,
+                "validationPassed"    to isValid,
+                "livenessPassed"      to livenessPassed,
+                "validationError"     to (if (isValid) "" else validationMsg)
+            )
+
+        } catch (e: Exception) {
+            android.util.Log.e("BiometricSDK", "processFrame error: ${e.message}", e)
+            noHandResult("Error: ${e.message}", e.message ?: "Unknown error")
         }
+    }
 
-        // val landmarks   = landmarkerResult.landmarks()[0]
-        // val fingerCount = countExtendedFingers(landmarks)
-        // val guidance    = getGuidance(fingerCount, quality, landmarks)
+    // ─────────────────────────────────────────────────────────────────────────
+    // STRICT CAPTURE MODE VALIDATION
+    //
+    // This is the sole gatekeeper for readyToCapture.
+    // Every branch that should block capture returns false.
+    // No "soft" passes, no "adjusting..." that return true.
+    // ─────────────────────────────────────────────────────────────────────────
 
-        val landmarks = landmarkerResult.landmarks()[0]
-        
-        // 1. MediaPipe se pata karein ki haath Left hai ya Right
-        var handedness = landmarkerResult.handednesses()[0][0].categoryName()
-        
-        // (Optional Fix: Front camera aksar mirror image deta hai, isliye Left ko Right aur Right ko Left karna padta hai. Agar ulta aaye toh ise swap kar lein)
-        if (handedness == "Left") handedness = "Right" else handedness = "Left"
+    private fun validateCaptureMode(
+        captureMode: String,
+        detectedFingers: List<String>,     // corrected finger names
+        correctedHandedness: String,        // "Left" or "Right" (raw for back camera)
+        fingersRequested: List<String>,
+        missingFingers: List<String>
+    ): Pair<Boolean, String> {
 
-        // 2. Naya function call karein jo exact ungliyan batayega
-        val detectedFingersList = getDetectedFingers(landmarks, handedness)
-        val fingerCount = detectedFingersList.size
-        
-        // List ko comma-separated string bana lein (e.g. "RIGHT_INDEX, RIGHT_MIDDLE")
-        val detectedFingersStr = detectedFingersList.joinToString(", ")
+        return when (captureMode) {
 
-        val guidance = getGuidance(fingerCount, quality, landmarks)
+            // ── LEFT_FOUR ─────────────────────────────────────────────────
+            // Required: exactly LEFT_INDEX, LEFT_MIDDLE, LEFT_RING, LEFT_LITTLE
+            // Blocked:  right hand, thumb visible, wrong count
+            "LEFT_FOUR" -> {
+                val required = listOf(
+                    "LEFT_INDEX", "LEFT_MIDDLE", "LEFT_RING", "LEFT_LITTLE"
+                )
+                when {
+                    correctedHandedness == "Right" ->
+                        false to "Please use your LEFT hand"
+                    detectedFingers.any { it.startsWith("RIGHT_") } ->
+                        false to "Please use your LEFT hand"
+                    "LEFT_THUMB" in detectedFingers ->
+                        false to "Please hide your thumb — show 4 fingers only"
+                    detectedFingers.size < 4 ->
+                        false to "Show all 4 fingers: Index, Middle, Ring and Little"
+                    detectedFingers.size > 4 ->
+                        false to "Too many fingers — show exactly 4 fingers"
+                    !detectedFingers.containsAll(required) ->
+                        false to "Ensure Index, Middle, Ring and Little are all visible"
+                    else -> true to "Valid"
+                }
+            }
 
-        android.util.Log.d("BiometricSDK", "Detected Fingers: $detectedFingersStr")
+            // ── RIGHT_FOUR ────────────────────────────────────────────────
+            "RIGHT_FOUR" -> {
+                val required = listOf(
+                    "RIGHT_INDEX", "RIGHT_MIDDLE", "RIGHT_RING", "RIGHT_LITTLE"
+                )
+                when {
+                    correctedHandedness == "Left" ->
+                        false to "Please use your RIGHT hand"
+                    detectedFingers.any { it.startsWith("LEFT_") } ->
+                        false to "Please use your RIGHT hand"
+                    "RIGHT_THUMB" in detectedFingers ->
+                        false to "Please hide your thumb — show 4 fingers only"
+                    detectedFingers.size < 4 ->
+                        false to "Show all 4 fingers: Index, Middle, Ring and Little"
+                    detectedFingers.size > 4 ->
+                        false to "Too many fingers — show exactly 4 fingers"
+                    !detectedFingers.containsAll(required) ->
+                        false to "Ensure Index, Middle, Ring and Little are all visible"
+                    else -> true to "Valid"
+                }
+            }
 
-        android.util.Log.d("BiometricSDK",
-            "Fingers: $fingerCount")
+            // ── LEFT_THUMB ────────────────────────────────────────────────
+            // Required: only LEFT_THUMB, no other fingers, left hand only.
+            "LEFT_THUMB" -> {
+                when {
+                    correctedHandedness == "Right" ->
+                        false to "Please use your LEFT hand"
+                    detectedFingers.any { it.startsWith("RIGHT_") } ->
+                        false to "Please use your LEFT hand"
+                    detectedFingers.isEmpty() ->
+                        false to "Show only your left thumb"
+                    "LEFT_THUMB" !in detectedFingers ->
+                        false to "Left thumb not detected — extend your left thumb"
+                    detectedFingers.size > 1 ->
+                        false to "Show only your left thumb — fold all other fingers"
+                    else -> true to "Valid"
+                }
+            }
 
-            // ── 🚀 NAYA CODE YAHAN ADD HUA HAI ──────────────────────────
-        
-        // 1. Landmarks ko FloatArray mein convert karein
-        val points = FloatArray(42)// 21 landmarks * 2 (x, y)
-        for(i in 0 until 21 ) {
-            points[i * 2] = landmarks[i].x()
-            points[i * 2 + 1] = landmarks[i].y()
+            // ── RIGHT_THUMB ───────────────────────────────────────────────
+            "RIGHT_THUMB" -> {
+                when {
+                    correctedHandedness == "Left" ->
+                        false to "Please use your RIGHT hand"
+                    detectedFingers.any { it.startsWith("LEFT_") } ->
+                        false to "Please use your RIGHT hand"
+                    detectedFingers.isEmpty() ->
+                        false to "Show only your right thumb"
+                    "RIGHT_THUMB" !in detectedFingers ->
+                        false to "Right thumb not detected — extend your right thumb"
+                    detectedFingers.size > 1 ->
+                        false to "Show only your right thumb — fold all other fingers"
+                    else -> true to "Valid"
+                }
+            }
+
+            // ── SINGLE_FINGER ─────────────────────────────────────────────
+            "SINGLE_FINGER" -> {
+                when {
+                    detectedFingers.isEmpty() ->
+                        false to "Show one finger clearly in front of the camera"
+                    detectedFingers.size > 1 ->
+                        false to "Too many fingers — show only one finger at a time"
+                    else -> true to "Valid"
+                }
+            }
+
+            // ── CUSTOM_SEQUENCE ───────────────────────────────────────────
+            // Caller passes exact required list in fingersRequested.
+            "CUSTOM_SEQUENCE" -> {
+                when {
+                    fingersRequested.isEmpty() ->
+                        false to "No fingers specified for custom sequence"
+                    detectedFingers.isEmpty() ->
+                        false to "No fingers detected — place your hand in view"
+                    else -> {
+                        val missing = fingersRequested.filter { it !in detectedFingers }
+                        val extra   = detectedFingers.filter  { it !in fingersRequested }
+                        when {
+                            missing.isNotEmpty() ->
+                                false to "Missing: ${missing.humanReadable()}"
+                            extra.isNotEmpty() ->
+                                false to "Extra finger(s) — hide: ${extra.humanReadable()}"
+                            else -> true to "Valid"
+                        }
+                    }
+                }
+            }
+
+            // ── PARTIAL_CAPTURE ───────────────────────────────────────────
+            // Only validate fingers NOT in missingFingers.
+            "PARTIAL_CAPTURE" -> {
+                val expected = fingersRequested.filter { it !in missingFingers }
+                when {
+                    expected.isEmpty() ->
+                        true to "Valid (all fingers marked as missing)"
+                    detectedFingers.isEmpty() ->
+                        false to "No fingers detected — place your hand in view"
+                    else -> {
+                        val missing = expected.filter        { it !in detectedFingers }
+                        val extra   = detectedFingers.filter { it !in expected && it !in missingFingers }
+                        when {
+                            missing.isNotEmpty() ->
+                                false to "Missing: ${missing.humanReadable()}"
+                            extra.isNotEmpty() ->
+                                false to "Unexpected finger: ${extra.humanReadable()}"
+                            else -> true to "Valid"
+                        }
+                    }
+                }
+            }
+
+            else -> false to "Unknown capture mode: $captureMode"
         }
-
-        // 2. C++ function call karein (Crop aur Enhance ke liye)
-        val processedBytes = NativeProcessor.processFingerprint(
-            imageBytes,
-            bitmap.width,
-            bitmap.height,
-            points
-        )
-
-        // 3. Processed image ko Base64 banakar Flutter ko bhejein
-        val processedBase64 = if (processedBytes != null) {
-            android.util.Base64.encodeToString(processedBytes, android.util.Base64.NO_WRAP)
-        } else {
-            ""
-        }
-
-
-
-        mapOf(
-            "fingerDetected" to (fingerCount > 0),
-            "confidence"     to 0.88,
-            "guidance"       to guidance,
-            "qualityScore"   to quality,
-            "fingerCount"    to fingerCount,
-            "detectedFingersName" to detectedFingersStr,
-            "processedImage" to processedBase64,
-            "readyToCapture" to (quality >= 70 && fingerCount > 0)
-        )
-
-    } catch (e: Exception) {
-        android.util.Log.e("BiometricSDK", "Error: ${e.message}")
-        mapOf(
-            "fingerDetected" to false,
-            "confidence"     to 0.0,
-            "guidance"       to "Error: ${e.message}",
-            "qualityScore"   to 0,
-            "fingerCount"    to 0,
-            "readyToCapture" to false
-        )
     }
-}
 
-// ── Rotation Helper ───────────────────────────────────────
-private fun rotateBitmap(bitmap: Bitmap): Bitmap {
-    return try {
-        // Try 0, 90, 180, 270 — sahi wala detect karo
-        // Pehle 90 degree try karo
-        val matrix = Matrix()
-        matrix.postRotate(270f)
-        Bitmap.createBitmap(
-            bitmap, 0, 0,
-            bitmap.width, bitmap.height,
-            matrix, true
-        )
-    } catch (e: Exception) {
-        bitmap // Original return karo agar fail ho
-    }
-}
+    // ─────────────────────────────────────────────────────────────────────────
+    // FINGER DETECTION
+    //
+    // correctedHandedness is the hand side (raw for back camera: "Left" or "Right").
+    // prefix is therefore the correct side for finger naming.
+    //
+    // Thumb: compare tip-to-wrist vs ip-to-wrist distances (robust to rotation).
+    // Four fingers: tip-above-pip on Y-axis (smaller Y = higher in image).
+    // ─────────────────────────────────────────────────────────────────────────
 
-// ── Debug Image Saver ─────────────────────────────────────
-private fun saveBitmapForDebug(bitmap: Bitmap) {
-    try {
-        val file = java.io.File(
-            context.getExternalFilesDir(null),
-            "debug_frame.jpg"
-        )
-        val out = FileOutputStream(file)
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
-        out.close()
-        android.util.Log.d("BiometricSDK",
-            "Image saved: ${file.absolutePath}")
-    } catch (e: Exception) {
-        android.util.Log.e("BiometricSDK",
-            "Save failed: ${e.message}")
-    }
-}
-
-    // ── Finger Count ──────────────────────────────────────────
-    // private fun countExtendedFingers(
-    //     landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>
-    // ): Int {
-    //     var count = 0
-
-    //     // Index finger — tip(8) > pip(6)
-    //     if (landmarks[8].y() < landmarks[6].y()) count++
-    //     // Middle finger — tip(12) > pip(10)
-    //     if (landmarks[12].y() < landmarks[10].y()) count++
-    //     // Ring finger — tip(16) > pip(14)
-    //     if (landmarks[16].y() < landmarks[14].y()) count++
-    //     // Little finger — tip(20) > pip(18)i devloping 
-    //     if (landmarks[20].y() < landmarks[18].y()) count++
-
-    //     return count
-    // }
-    // ── NAYA FUNCTION: Finger aur Hand Pehchanne ke liye ────────────────
     private fun getDetectedFingers(
         landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>,
-        handedness: String
+        correctedHandedness: String
     ): List<String> {
-        val fingers = mutableListOf<String>()
-        val prefix = handedness.uppercase() // Result: "LEFT" ya "RIGHT"
 
-        // Thumb (Angutha) - tip(4) > ip(3)
-        if (landmarks[4].y() < landmarks[3].y()) fingers.add("${prefix}_THUMB")
-        
-        // Index (Pehli ungli) - tip(8) > pip(6)
-        if (landmarks[8].y() < landmarks[6].y()) fingers.add("${prefix}_INDEX")
-        
-        // Middle (Beech ki ungli) - tip(12) > pip(10)
+        val fingers = mutableListOf<String>()
+        val prefix  = correctedHandedness.uppercase()   // "LEFT" or "RIGHT"
+
+        // Thumb: tip further from wrist than IP → extended
+        val tipToWrist = dist(landmarks[4].x(), landmarks[4].y(),
+                              landmarks[0].x(), landmarks[0].y())
+        val ipToWrist  = dist(landmarks[3].x(), landmarks[3].y(),
+                              landmarks[0].x(), landmarks[0].y())
+        if (tipToWrist > ipToWrist * 1.15f) fingers.add("${prefix}_THUMB")
+
+        // Four fingers: tip Y < pip Y → extended upward
+        if (landmarks[8].y()  < landmarks[6].y())  fingers.add("${prefix}_INDEX")
         if (landmarks[12].y() < landmarks[10].y()) fingers.add("${prefix}_MIDDLE")
-        
-        // Ring (Teesri ungli) - tip(16) > pip(14)
         if (landmarks[16].y() < landmarks[14].y()) fingers.add("${prefix}_RING")
-        
-        // Little (Chhoti ungli) - tip(20) > pip(18)
         if (landmarks[20].y() < landmarks[18].y()) fingers.add("${prefix}_LITTLE")
+
+        android.util.Log.d("BiometricSDK", "getDetectedFingers [$prefix]: $fingers")
 
         return fingers
     }
 
-    // ── Quality Calculate ─────────────────────────────────────
-    private fun calculateQuality(
+    // ─────────────────────────────────────────────────────────────────────────
+    // GUIDANCE — priority order per PDF spec
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun buildGuidance(
+        isValid: Boolean,
+        validationMsg: String,
+        livenessPassed: Boolean,
+        overallQuality: Int,
+        isBlurry: Boolean,
+        brightnessScore: Int,
+        centeringScore: Int,
+        captureMode: String,
+        fingerCount: Int,
+        landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>,
+        qualityDetails: Map<String, Any>
+    ): String = when {
+        !livenessPassed ->
+            "Liveness check failed — ensure a real hand is present"
+        overallQuality < QUALITY_THRESHOLD_CAPTURE ->
+            "Improve image quality — hold steady in good light"
+        !isValid ->
+            validationMsg                               // strict mode message IS the guidance
+        isBlurry ->
+            "Hold the camera still — image is blurry"
+        brightnessScore < BRIGHTNESS_MIN ->
+            "Increase lighting for better quality"
+        centeringScore < CENTERING_MIN ->
+            "Center your hand in the frame"
+        overallQuality < QUALITY_THRESHOLD_GOOD ->
+            "Move closer to the camera"
+        else -> when (captureMode) {
+            "LEFT_FOUR"    -> "Hold still — capturing left 4 fingers!"
+            "RIGHT_FOUR"   -> "Hold still — capturing right 4 fingers!"
+            "LEFT_THUMB"   -> "Hold still — capturing left thumb!"
+            "RIGHT_THUMB"  -> "Hold still — capturing right thumb!"
+            "SINGLE_FINGER"-> "Hold still — capturing finger!"
+            else           -> "Hold still — capturing now!"
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // QUALITY ASSESSMENT — C++ first (with blur from Laplacian variance), Kotlin fallback
+    // PDF spec weights: 40% blur, 30% brightness, 30% centering
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun assessAdvancedQuality(
         bitmap: Bitmap,
         landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>
-    ): Int {
-        var score = 60
+    ): Map<String, Any> {
+        try {
+            val stream = java.io.ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream)
+            val imageBytes = stream.toByteArray()
 
-        // Size check
-        if (bitmap.width >= 640 && bitmap.height >= 480) score += 10
+            val handCenterX = (landmarks[9].x() * bitmap.width).toInt()
+            val handCenterY = (landmarks[9].y() * bitmap.height).toInt()
 
-        // Brightness check
-        val brightness = getBrightness(bitmap)
-        if (brightness in 80.0..200.0) score += 15
+            val points = FloatArray(42)
+            for (i in 0 until 21) {
+                points[i * 2]     = landmarks[i].x()
+                points[i * 2 + 1] = landmarks[i].y()
+            }
 
-        // Center mein hai?
-        val handCenterX = landmarks[9].x()
-        if (handCenterX in 0.3f..0.7f) score += 15
+            // Call C++ to get all quality metrics including blur from Laplacian variance
+            val metrics = NativeProcessor.calculateQualityMetrics(
+                imageBytes, bitmap.width, bitmap.height, points, handCenterX, handCenterY
+            )
 
-        return score.coerceIn(0, 100)
-    }
+            if (metrics != null && metrics.size >= 5) {
+                // C++ returns: [blurScore, brightnessScore, centeringScore, sizeScore, overallScore]
+                val blurScore       = metrics[0].toInt()
+                val brightnessScore = metrics[1].toInt()
+                val centeringScore  = metrics[2].toInt()
+                val sizeScore       = metrics[3].toInt()
+                val overallScore    = metrics[4].toInt()
 
-    // ── Brightness ────────────────────────────────────────────
-    private fun getBrightness(bitmap: Bitmap): Double {
-        var total = 0L
-        val sample = 100
-        val w = bitmap.width
-        val h = bitmap.height
+                android.util.Log.d("BiometricSDK",
+                    "C++ Quality: blur=$blurScore (Laplacian variance), brightness=$brightnessScore, " +
+                    "centering=$centeringScore, overall=$overallScore")
 
-        for (i in 0 until sample) {
-            val x = (Math.random() * w).toInt()
-            val y = (Math.random() * h).toInt()
-            val pixel = bitmap.getPixel(x, y)
-            val r = (pixel shr 16) and 0xff
-            val g = (pixel shr 8) and 0xff
-            val b = pixel and 0xff
-            total += (r + g + b) / 3
+                return mapOf(
+                    "overallScore"     to overallScore,
+                    "blurScore"        to blurScore,
+                    "brightnessScore"  to brightnessScore,
+                    "centeringScore"   to centeringScore,
+                    "sizeScore"        to sizeScore,
+                    "isTooBlurry"      to (blurScore < BLUR_THRESHOLD_MOTION),
+                    "isTooDark"        to (brightnessScore < BRIGHTNESS_MIN),
+                    "isPoorlyCentered" to (centeringScore < CENTERING_MIN),
+                    "source"           to "cpp"
+                )
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("BiometricSDK", "C++ quality failed: ${e.message}")
         }
-        return total.toDouble() / sample
+
+        android.util.Log.d("BiometricSDK", "Using Kotlin fallback quality")
+        return assessAdvancedQualityFallback(bitmap)
     }
 
-    // ── Guidance Text ─────────────────────────────────────────
-    private fun getGuidance(
-        fingerCount: Int,
-        quality: Int,
-        landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>
-    ): String {
-        if (fingerCount == 0) return "Please palce your hand"
-        if (quality < 50) return "More light needed"
-        val cx = landmarks[9].x()
-        if (cx < 0.3f) return "Move slightly to the right"
-        if (cx > 0.7f) return "Move slightly to the left"
-        if (quality < 70) return "Move closer to camera"
-        return "Perfect — Capturing now!"
+    private fun assessAdvancedQualityFallback(bitmap: Bitmap): Map<String, Any> {
+        val brightnessRaw   = getBrightness(bitmap, sampleCount = 200)
+        val brightnessScore = when {
+            brightnessRaw < 40  -> 0
+            brightnessRaw < 60  -> 40
+            brightnessRaw > 230 -> 0
+            brightnessRaw > 200 -> 50
+            else                -> 100
+        }
+        val sharpnessScore = computeSharpnessScore(bitmap)
+        val coverageScore  = computeFingerCoverageScore(bitmap)
+
+        // PDF weights: 40% blur, 30% brightness, 30% coverage (proxy for centering)
+        val overallScore = (
+            sharpnessScore * BLUR_WEIGHT +
+            brightnessScore * BRIGHTNESS_WEIGHT +
+            coverageScore   * CENTERING_WEIGHT
+        ).toInt().coerceIn(0, 100)
+
+        return mapOf(
+            "overallScore"     to overallScore,
+            "blurScore"        to sharpnessScore,
+            "brightnessScore"  to brightnessScore,
+            "centeringScore"   to 50,
+            "sizeScore"        to coverageScore,
+            "isTooBlurry"      to (sharpnessScore < BLUR_THRESHOLD_MOTION),
+            "isTooDark"        to (brightnessRaw < 60),
+            "source"           to "kotlin"
+        )
     }
 
-    // ── Final Capture ─────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // LIVENESS CHECK
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun checkLiveness(
+        landmarks: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>,
+        bitmap: Bitmap
+    ): Pair<Boolean, Double> {
+        var score = 0.0
+
+        // 1. Palm/finger length ratio
+        val wristX = landmarks[0].x(); val wristY = landmarks[0].y()
+        val mcpX   = landmarks[9].x(); val mcpY   = landmarks[9].y()
+        val tipX   = landmarks[12].x();val tipY   = landmarks[12].y()
+        val palmLen   = dist(wristX, wristY, mcpX, mcpY)
+        val fingerLen = dist(mcpX, mcpY, tipX, tipY)
+        if (palmLen > 0.01f && fingerLen > 0.01f && palmLen / fingerLen in 0.5..2.5) score += 1.0
+
+        // 2. Tip spread
+        val tipXs = listOf(
+            landmarks[4].x(), landmarks[8].x(), landmarks[12].x(),
+            landmarks[16].x(), landmarks[20].x()
+        )
+        val tipXRange = (tipXs.maxOrNull() ?: 0f) - (tipXs.minOrNull() ?: 0f)
+        if (tipXRange > 0.05f) score += 1.0
+
+        // 3. Z-depth variation
+        val zValues = landmarks.map { it.z() }
+        val zRange  = (zValues.maxOrNull() ?: 0f) - (zValues.minOrNull() ?: 0f)
+        if (zRange > 0.05f) score += 1.0
+
+        // 4. Skin-tone texture variance in palm
+        val palmCx  = ((wristX + mcpX) / 2 * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+        val palmCy  = ((wristY + mcpY) / 2 * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+        val sampleW = (bitmap.width  * 0.06).toInt().coerceAtLeast(8)
+        val sampleH = (bitmap.height * 0.06).toInt().coerceAtLeast(8)
+        val reds = mutableListOf<Int>(); val greens = mutableListOf<Int>()
+        for (dy in -sampleH..sampleH step 2) {
+            for (dx in -sampleW..sampleW step 2) {
+                val px = (palmCx + dx).coerceIn(0, bitmap.width  - 1)
+                val py = (palmCy + dy).coerceIn(0, bitmap.height - 1)
+                val pixel = bitmap.getPixel(px, py)
+                reds.add(Color.red(pixel)); greens.add(Color.green(pixel))
+            }
+        }
+        if (reds.isNotEmpty()) {
+            val redStd   = stdDev(reds.map   { it.toDouble() })
+            val greenStd = stdDev(greens.map { it.toDouble() })
+            if (redStd > 4.0 && greenStd > 4.0) score += 1.0
+        }
+
+        val normalised = score / 4.0
+        return Pair(normalised >= 0.5, normalised)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FINAL CAPTURE — structured API response
+    // ─────────────────────────────────────────────────────────────────────────
+
     private fun handleCapture(
         mode: String,
         imageBytes: ByteArray?,
+        missingFingers: List<String>,
+        detectedFinger: String,
+        actualQuality: Int,
         result: Result
     ) {
         try {
-            val fingers = getFingerListForMode(mode)
+            val allFingers      = getFingerListForMode(mode, detectedFinger)
+            val capturedFingers = allFingers.filter { it !in missingFingers }
 
-            val fingerResults = fingers.map { fingerId ->
+            android.util.Log.d("BiometricSDK_CAPTURE",
+                "Captured: $capturedFingers, Missing: $missingFingers")
+
+            val fingerResults = capturedFingers.map { fingerId ->
                 mapOf(
                     "fingerId"       to fingerId,
                     "status"         to "success",
-                    "qualityScore"   to 85,
-                    "livenessPassed" to true,
+                    "qualityScore"   to actualQuality,
+                    "livenessPassed" to (actualQuality >= QUALITY_THRESHOLD_CAPTURE),
                     "template"       to generateTemplate(imageBytes),
                     "rawImage"       to (imageBytes?.let {
                         Base64.encodeToString(it, Base64.DEFAULT)
@@ -384,38 +717,167 @@ private fun saveBitmapForDebug(bitmap: Bitmap) {
                     "errorCode"      to null,
                     "errorMessage"   to null
                 )
+            } + missingFingers.map { fingerId ->
+                mapOf(
+                    "fingerId"       to fingerId,
+                    "status"         to "missing",
+                    "qualityScore"   to 0,
+                    "livenessPassed" to false,
+                    "template"       to "",
+                    "rawImage"       to "",
+                    "processedImage" to "",
+                    "errorCode"      to "FINGER_MISSING",
+                    "errorMessage"   to "Finger marked as missing by caller"
+                )
             }
 
+            val transactionId = UUID.randomUUID().toString()
+            android.util.Log.d("BiometricSDK_CAPTURE", "SUCCESS — txnId=$transactionId")
+
             result.success(mapOf(
-                "transactionId" to UUID.randomUUID().toString(),
+                "transactionId" to transactionId,
                 "overallStatus" to "success",
                 "captureMode"   to mode,
                 "results"       to fingerResults
             ))
 
         } catch (e: Exception) {
+            android.util.Log.e("BiometricSDK_CAPTURE", "Capture ERROR: ${e.message}", e)
             result.error("CAPTURE_ERROR", e.message, null)
         }
     }
 
-    // ── Mode → Fingers ────────────────────────────────────────
-    private fun getFingerListForMode(mode: String): List<String> {
-        return when (mode) {
-            "RIGHT_FOUR"  -> listOf(
-                "RIGHT_INDEX", "RIGHT_MIDDLE",
-                "RIGHT_RING", "RIGHT_LITTLE"
+    // ─────────────────────────────────────────────────────────────────────────
+    // UTILITY HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Which corrected hand does this mode require?  null = any hand */
+    private fun getRequiredHandedness(captureMode: String): String? = when (captureMode) {
+        "LEFT_FOUR",  "LEFT_THUMB"  -> "Left"
+        "RIGHT_FOUR", "RIGHT_THUMB" -> "Right"
+        else                        -> null
+    }
+
+    /** Full finger list expected for a capture mode */
+    private fun getFingerListForMode(mode: String, detectedFinger: String = ""): List<String> =
+        when (mode) {
+            "RIGHT_FOUR"    -> listOf("RIGHT_INDEX","RIGHT_MIDDLE","RIGHT_RING","RIGHT_LITTLE")
+            "LEFT_FOUR"     -> listOf("LEFT_INDEX", "LEFT_MIDDLE", "LEFT_RING", "LEFT_LITTLE")
+            "RIGHT_THUMB"   -> listOf("RIGHT_THUMB")
+            "LEFT_THUMB"    -> listOf("LEFT_THUMB")
+            "SINGLE_FINGER" -> listOf(if (detectedFinger.isNotEmpty()) detectedFinger else "RIGHT_INDEX")
+            else            -> listOf(if (detectedFinger.isNotEmpty()) detectedFinger else "RIGHT_INDEX")
+        }
+
+    /** Standard "no hand" result map */
+    private fun noHandResult(
+        guidance: String,
+        error: String,
+        qualityReport: Map<String, Any> = mapOf("overallScore" to 0)
+    ): Map<String, Any> = mapOf(
+        "fingerDetected"      to false,
+        "confidence"          to 0.0,
+        "guidance"            to guidance,
+        "qualityScore"        to (qualityReport["overallScore"] as? Int ?: 0),
+        "qualityDetails"      to qualityReport,
+        "fingerCount"         to 0,
+        "detectedFingersName" to "",
+        "firstDetectedFinger" to "",
+        "processedImage"      to "",
+        "readyToCapture"      to false,
+        "validationPassed"    to false,
+        "livenessPassed"      to false,
+        "validationError"     to error
+    )
+
+    private fun dist(x1: Float, y1: Float, x2: Float, y2: Float): Float =
+        sqrt((x2 - x1).pow(2) + (y2 - y1).pow(2))
+
+    private fun stdDev(values: List<Double>): Double {
+        if (values.isEmpty()) return 0.0
+        val mean = values.average()
+        return sqrt(values.map { (it - mean).pow(2) }.average())
+    }
+
+    private fun getBrightness(bitmap: Bitmap, sampleCount: Int = 100): Double {
+        var total = 0L
+        val w = bitmap.width; val h = bitmap.height
+        repeat(sampleCount) {
+            val x = (Math.random() * w).toInt().coerceIn(0, w - 1)
+            val y = (Math.random() * h).toInt().coerceIn(0, h - 1)
+            val p = bitmap.getPixel(x, y)
+            total += ((p shr 16 and 0xff) + (p shr 8 and 0xff) + (p and 0xff)) / 3
+        }
+        return total.toDouble() / sampleCount
+    }
+
+    private fun computeSharpnessScore(bitmap: Bitmap): Int {
+        val scaled = Bitmap.createScaledBitmap(bitmap, 200, 200, true)
+        val w = scaled.width; val h = scaled.height
+        var sumLap = 0.0; var count = 0
+        for (y in 1 until h - 1) for (x in 1 until w - 1) {
+            val c  = gray(scaled.getPixel(x,     y    ))
+            val n  = gray(scaled.getPixel(x,     y - 1))
+            val s  = gray(scaled.getPixel(x,     y + 1))
+            val e  = gray(scaled.getPixel(x + 1, y    ))
+            val ww = gray(scaled.getPixel(x - 1, y    ))
+            sumLap += abs(4 * c - n - s - e - ww).toDouble()
+            count++
+        }
+        return ((if (count > 0) sumLap / count else 0.0) / 12.0 * 100)
+            .toInt().coerceIn(0, 100)
+    }
+
+    private fun computeContrastScore(bitmap: Bitmap): Int {
+        val w = bitmap.width; val h = bitmap.height
+        val values = mutableListOf<Double>()
+        repeat(300) {
+            val p = bitmap.getPixel(
+                (Math.random() * w).toInt().coerceIn(0, w - 1),
+                (Math.random() * h).toInt().coerceIn(0, h - 1)
             )
-            "LEFT_FOUR"   -> listOf(
-                "LEFT_INDEX", "LEFT_MIDDLE",
-                "LEFT_RING", "LEFT_LITTLE"
-            )
-            "RIGHT_THUMB" -> listOf("RIGHT_THUMB")
-            "LEFT_THUMB"  -> listOf("LEFT_THUMB")
-            else          -> listOf("RIGHT_INDEX")
+            values.add(Color.red(p) * 0.299 + Color.green(p) * 0.587 + Color.blue(p) * 0.114)
+        }
+        val mean = values.average()
+        val variance = values.map { (it - mean) * (it - mean) }.average()
+        return (sqrt(variance) / 60.0 * 100).toInt().coerceIn(0, 100)
+    }
+
+    private fun computeFingerCoverageScore(bitmap: Bitmap): Int {
+        val scaled = Bitmap.createScaledBitmap(bitmap, 100, 100, true)
+        val w = scaled.width; val h = scaled.height
+        val bgBrightness = listOf(
+            scaled.getPixel(0, 0), scaled.getPixel(w - 1, 0),
+            scaled.getPixel(0, h - 1), scaled.getPixel(w - 1, h - 1)
+        ).map { Color.red(it) * 0.299 + Color.green(it) * 0.587 + Color.blue(it) * 0.114 }
+            .average()
+        var fg = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            val px = scaled.getPixel(x, y)
+            val br = Color.red(px) * 0.299 + Color.green(px) * 0.587 + Color.blue(px) * 0.114
+            if (abs(br - bgBrightness) > 25) fg++
+        }
+        return (fg.toDouble() / (w * h) / 0.5 * 100).toInt().coerceIn(0, 100)
+    }
+
+    private fun gray(pixel: Int): Int =
+        (Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114).toInt()
+
+    private fun rotateBitmap(bitmap: Bitmap): Bitmap = try {
+        val matrix = Matrix(); matrix.postRotate(270f)
+        Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    } catch (e: Exception) { bitmap }
+
+    private fun saveBitmapForDebug(bitmap: Bitmap) {
+        try {
+            val file = java.io.File(context.getExternalFilesDir(null), "debug_frame.jpg")
+            FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            android.util.Log.d("BiometricSDK", "Debug image: ${file.absolutePath}")
+        } catch (e: Exception) {
+            android.util.Log.e("BiometricSDK", "Debug save failed: ${e.message}")
         }
     }
 
-    // ── Template Generate ─────────────────────────────────────
     private fun generateTemplate(imageBytes: ByteArray?): String {
         if (imageBytes == null) {
             val dummy = ByteArray(512) { it.toByte() }
@@ -424,10 +886,8 @@ private fun saveBitmapForDebug(bitmap: Bitmap) {
         return Base64.encodeToString(imageBytes, Base64.DEFAULT)
     }
 
-    override fun onDetachedFromEngine(
-        binding: FlutterPlugin.FlutterPluginBinding
-    ) {
-        handLandmarker?.close()
-        channel.setMethodCallHandler(null)
-    }
+    private fun List<String>.humanReadable(): String =
+        joinToString(", ") {
+            it.replace("_", " ").lowercase().replaceFirstChar { c -> c.uppercase() }
+        }
 }
