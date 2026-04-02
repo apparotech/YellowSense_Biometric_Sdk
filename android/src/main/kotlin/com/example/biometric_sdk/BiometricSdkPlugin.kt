@@ -113,6 +113,7 @@ private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
                 "guidance"       to "Image could not be loaded",
                 "qualityScore"   to 0,
                 "fingerCount"    to 0,
+                "fingerBoxes"    to emptyList<Map<String, Any>>(),
                 "readyToCapture" to false
             )
         }
@@ -148,6 +149,7 @@ private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
                 "guidance"       to "Place your hand in front of camera",
                 "qualityScore"   to quality,
                 "fingerCount"    to 0,
+                "fingerBoxes"    to emptyList<Map<String, Any>>(),
                 "readyToCapture" to false
             )
         }
@@ -160,6 +162,7 @@ private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
         
         // 1. MediaPipe se pata karein ki haath Left hai ya Right
         var handedness = landmarkerResult.handednesses()[0][0].categoryName()
+
         
         // (Optional Fix: Front camera aksar mirror image deta hai, isliye Left ko Right aur Right ko Left karna padta hai. Agar ulta aaye toh ise swap kar lein)
         if (handedness == "Left") handedness = "Right" else handedness = "Left"
@@ -173,10 +176,51 @@ private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
 
         val guidance = getGuidance(fingerCount, quality, landmarks)
 
+
         android.util.Log.d("BiometricSDK", "Detected Fingers: $detectedFingersStr")
 
         android.util.Log.d("BiometricSDK",
             "Fingers: $fingerCount")
+
+            // ── 🚀 NAYA ADVANCED FEATURE: LIVE FINGER BOXES ─────────────────────────
+        
+        
+        
+        val fingerBoxes = mutableListOf<Map<String, Any>>()
+
+        val fingerLandmarksIndices = listOf(
+            listOf(1, 2, 3, 4) to "THUMB",
+            listOf(5, 6, 7, 8) to "INDEX",
+            listOf(9, 10, 11, 12) to "MIDDLE",
+            listOf(13, 14, 15, 16) to "RING",
+            listOf(17, 18, 19, 20) to "LITTLE"
+        )
+
+        for ((indices, fingerName) in fingerLandmarksIndices) {
+            val rawPoints = indices.map { landmarks[it] }
+
+            // 100% Fail-Proof Rotation: Portrait mode ke liye X aur Y swap aur mirror
+            val xValues = rawPoints.map { it.y() } 
+            val yValues = rawPoints.map { 1.0f - it.x() } 
+            
+            val padding = 0.04f // Bounding box thoda bada dikhe
+            
+            val minX = (xValues.minOrNull() ?: 0.0f) - padding
+            val minY = (yValues.minOrNull() ?: 0.0f) - padding
+            val maxX = (xValues.maxOrNull() ?: 1.0f) + padding
+            val maxY = (yValues.maxOrNull() ?: 1.0f) + padding
+
+            // Bina kisi condition ke list mein add karein taaki humesha draw ho
+            fingerBoxes.add(mapOf(
+                "x1" to minX.coerceIn(0.0f, 1.0f),
+                "y1" to minY.coerceIn(0.0f, 1.0f),
+                "x2" to maxX.coerceIn(0.0f, 1.0f),
+                "y2" to maxY.coerceIn(0.0f, 1.0f),
+                "label" to "${handedness.uppercase()}_$fingerName"
+            ))
+        }
+
+        // ── 🚀 NAYA CODE YAHAN ADD HUA HAI ──────────────────────────
 
             // ── 🚀 NAYA CODE YAHAN ADD HUA HAI ──────────────────────────
         
@@ -195,24 +239,45 @@ private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
             points
         )
 
-        // 3. Processed image ko Base64 banakar Flutter ko bhejein
-        val processedBase64 = if (processedBytes != null) {
-            android.util.Base64.encodeToString(processedBytes, android.util.Base64.NO_WRAP)
-        } else {
-            ""
-        }
+     
+        var isLivenessPassed = true
+        var processedBase64 = ""
+        var finalGuidance = guidance // Purana guidance text
 
+        if (processedBytes != null) {
+            if (processedBytes.size == 1) {
+                // Agar C++ ne sirf 1 byte bheja, matlab FRAUD DETECTED! 🚨
+                isLivenessPassed = false
+                finalGuidance = "Spoof Detected! Please use a real finger."
+                android.util.Log.w("BiometricSDK", "LIVENESS FAILED: Fake finger blocked!")
+            } else {
+                // Asli ungli hai, Base64 banao
+               
+                val buffer = java.nio.ByteBuffer.wrap(processedBytes)
+                val imgSize = buffer.int // Pehle 4 bytes read karein (Image ka size)
+                
+                val imgData = ByteArray(imgSize)
+                buffer.get(imgData) // Sirf Image ka data nikalein
+                
+                val templateData = ByteArray(buffer.remaining())
+                buffer.get(templateData) // Bacha hua data Template hai
+                
+                // UI Preview ke liye sirf Image ko Base64 banayein
+                processedBase64 = android.util.Base64.encodeToString(imgData, android.util.Base64.NO_WRAP)
+            }
+        }
 
 
         mapOf(
             "fingerDetected" to (fingerCount > 0),
             "confidence"     to 0.88,
-            "guidance"       to guidance,
+            "guidance"       to finalGuidance,
             "qualityScore"   to quality,
             "fingerCount"    to fingerCount,
             "detectedFingersName" to detectedFingersStr,
+            "fingerBoxes"    to fingerBoxes,
             "processedImage" to processedBase64,
-            "readyToCapture" to (quality >= 70 && fingerCount > 0)
+           "readyToCapture" to (quality >= 70 && fingerCount > 0 && isLivenessPassed)
         )
 
     } catch (e: Exception) {
@@ -223,6 +288,7 @@ private fun processFrame(imageBytes: ByteArray): Map<String, Any> {
             "guidance"       to "Error: ${e.message}",
             "qualityScore"   to 0,
             "fingerCount"    to 0,
+            "fingerBoxes"    to emptyList<Map<String, Any>>(),
             "readyToCapture" to false
         )
     }
@@ -361,42 +427,134 @@ private fun saveBitmapForDebug(bitmap: Bitmap) {
         return "Perfect — Capturing now!"
     }
 
-    // ── Final Capture ─────────────────────────────────────────
-    private fun handleCapture(
-        mode: String,
-        imageBytes: ByteArray?,
-        result: Result
-    ) {
-        try {
-            val fingers = getFingerListForMode(mode)
+private fun handleCapture(
+    mode: String,
+    imageBytes: ByteArray?,
+    result: Result
+) {
+    try {
+        val fingers = getFingerListForMode(mode)
 
-            val fingerResults = fingers.map { fingerId ->
-                mapOf(
-                    "fingerId"       to fingerId,
-                    "status"         to "success",
-                    "qualityScore"   to 85,
-                    "livenessPassed" to true,
-                    "template"       to generateTemplate(imageBytes),
-                    "rawImage"       to (imageBytes?.let {
-                        Base64.encodeToString(it, Base64.DEFAULT)
-                    } ?: ""),
-                    "processedImage" to "",
-                    "errorCode"      to null,
-                    "errorMessage"   to null
+        // ── C++ se liveness check karo ───────────────────
+        var livenessPassed = true
+        var processedImageBase64 = ""
+        var finalIsoTemplateBase64 = ""
+
+        if (imageBytes != null) {
+            // Pehle MediaPipe se landmarks nikalo
+            val bitmap = BitmapFactory.decodeByteArray(
+                imageBytes, 0, imageBytes.size
+            )
+            
+            if (bitmap != null) {
+                val rotated = rotateBitmap(bitmap)
+                val argbBitmap = rotated.copy(
+                    Bitmap.Config.ARGB_8888, false
                 )
+                val mpImage = BitmapImageBuilder(argbBitmap).build()
+                val landmarkerResult = handLandmarker?.detect(mpImage)
+
+                // Landmarks mile toh C++ call karo
+                val landmarks = landmarkerResult
+                    ?.landmarks()
+                    ?.firstOrNull()
+
+                if (landmarks != null) {
+                    // FloatArray banao
+                    val points = FloatArray(42)
+                    for (i in 0 until 21) {
+                        points[i * 2]     = landmarks[i].x()
+                        points[i * 2 + 1] = landmarks[i].y()
+                    }
+
+                    // C++ call karo
+                    val processedBytes = NativeProcessor
+                        .processFingerprint(
+                            imageBytes,
+                            rotated.width,
+                            rotated.height,
+                            points
+                        )
+
+                    when {
+                        // Null = Error
+                        processedBytes == null -> {
+                            livenessPassed = false
+                            android.util.Log.w("BiometricSDK",
+                                "C++ returned null — spoof!")
+                        }
+                        // 1 byte = SPOOF
+                        processedBytes.size == 1 -> {
+                            livenessPassed = false
+                            android.util.Log.w("BiometricSDK",
+                                "SPOOF DETECTED by C++!")
+                        }
+                        // Valid = Real finger
+                        else -> {
+                            livenessPassed = true
+                            // 🔥 NAYA CODE: Unpack Image & Template for Capture 🔥
+                            val buffer = java.nio.ByteBuffer.wrap(processedBytes)
+                            val imgSize = buffer.int
+                            
+                            val imgData = ByteArray(imgSize)
+                            buffer.get(imgData)
+                            
+                            val templateData = ByteArray(buffer.remaining())
+                            buffer.get(templateData)
+                            
+                            processedImageBase64 = Base64.encodeToString(imgData, Base64.DEFAULT)
+                            finalIsoTemplateBase64 = Base64.encodeToString(templateData, Base64.DEFAULT)
+                            
+                            android.util.Log.d("BiometricSDK", "Liveness PASSED! Template Size: ${templateData.size} bytes")
+                        }
+                    }
+                } else {
+                    // Landmarks nahi mile
+                    livenessPassed = false
+                    android.util.Log.w("BiometricSDK",
+                        "No landmarks in capture!")
+                }
             }
-
-            result.success(mapOf(
-                "transactionId" to UUID.randomUUID().toString(),
-                "overallStatus" to "success",
-                "captureMode"   to mode,
-                "results"       to fingerResults
-            ))
-
-        } catch (e: Exception) {
-            result.error("CAPTURE_ERROR", e.message, null)
         }
+
+        // ── Finger Results Banao ──────────────────────────
+        val fingerResults = fingers.map { fingerId ->
+            mapOf(
+                "fingerId"       to fingerId,
+                "status"         to if (livenessPassed)
+                                    "success" else "failed",
+                "qualityScore"   to 85,
+                "livenessPassed" to livenessPassed, // ← Real!
+                "template"       to if (livenessPassed) finalIsoTemplateBase64 else "",
+                "rawImage"       to (imageBytes?.let {
+                    Base64.encodeToString(it, Base64.DEFAULT)
+                } ?: ""),
+                "processedImage" to processedImageBase64,
+                "errorCode"      to if (livenessPassed)
+                                    null else "SPOOF_DETECTED",
+                "errorMessage"   to if (livenessPassed)
+                                    null else "Liveness check failed"
+            )
+        }
+
+        // ── Overall Status ────────────────────────────────
+        val overallStatus = if (livenessPassed) 
+                            "success" else "failed"
+
+        result.success(mapOf(
+            "transactionId" to UUID.randomUUID().toString(),
+            "overallStatus" to overallStatus,
+            "captureMode"   to mode,
+            "results"       to fingerResults
+        ))
+
+    } catch (e: Exception) {
+        android.util.Log.e("BiometricSDK", 
+            "Capture error: ${e.message}")
+        result.error("CAPTURE_ERROR", e.message, null)
     }
+}
+
 
     // ── Mode → Fingers ────────────────────────────────────────
     private fun getFingerListForMode(mode: String): List<String> {
@@ -415,14 +573,7 @@ private fun saveBitmapForDebug(bitmap: Bitmap) {
         }
     }
 
-    // ── Template Generate ─────────────────────────────────────
-    private fun generateTemplate(imageBytes: ByteArray?): String {
-        if (imageBytes == null) {
-            val dummy = ByteArray(512) { it.toByte() }
-            return Base64.encodeToString(dummy, Base64.DEFAULT)
-        }
-        return Base64.encodeToString(imageBytes, Base64.DEFAULT)
-    }
+
 
     override fun onDetachedFromEngine(
         binding: FlutterPlugin.FlutterPluginBinding

@@ -427,8 +427,10 @@ class _CameraScreenState extends State<CameraScreen> {
   int _qualityScore = 0;
   int _fingerCount = 0;
   bool _capturing = false;
+  bool _isProcessingFrame = false;
   String _processedBase64 = '';
   String _detectedFingers = '';
+  List<dynamic> _fingerBoxes = [];
 
   static const _channel = MethodChannel('biometric_sdk');
   Timer? _timer;
@@ -467,17 +469,19 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  void _startTimer() {
+ void _startTimer() {
     _timer = Timer.periodic(
-      const Duration(seconds: 2),
+      const Duration(milliseconds: 1500), // 1.5 seconds thoda fast hai, par lock ke saath theek hai
       (timer) async {
-        if (_capturing || !_initialized) return;
+        // 🔥 Agar capture ho raha hai, ya pehla frame process ho raha hai, toh skip karo!
+        if (_capturing || !_initialized || _isProcessingFrame) return; 
         await _processFrame();
       },
     );
   }
 
   Future<void> _processFrame() async {
+    _isProcessingFrame = true;
     try {
       final image = await _controller!.takePicture();
       final bytes = await image.readAsBytes();
@@ -495,6 +499,7 @@ class _CameraScreenState extends State<CameraScreen> {
         _fingerCount    = result['fingerCount'] as int? ?? 0;
         _processedBase64 = result['processedImage'] as String? ?? '';
         _detectedFingers = result['detectedFingersName'] as String? ?? '';
+        _fingerBoxes = result['fingerBoxes'] as List<dynamic>? ?? [];
       });
 
       final ready = result['readyToCapture'] as bool? ?? false;
@@ -504,49 +509,12 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     } catch (e) {
       print('Frame error: $e');
+    }finally {
+      _isProcessingFrame = false; // 🔥 FRAME PROCESSING KHATAM - LOCK KHOL DO
     }
   }
 
-  // Future<void> _capture([Uint8List? existingBytes]) async {
-  //   if (_capturing) return;
-  //   setState(() {
-  //     _capturing = true;
-  //     _guidance  = 'Processing...';
-  //   });
-  //   _timer?.cancel();
-
-  //   try {
-  //     Uint8List bytes;
-  //     if (existingBytes != null) {
-  //       bytes = existingBytes;
-  //     } else {
-  //       final image = await _controller!.takePicture();
-  //       bytes = await image.readAsBytes();
-  //     }
-
-  //     final result = await _channel.invokeMethod('startCapture', {
-  //       'captureMode': widget.mode,
-  //       'image': bytes,
-  //     });
-
-  //     if (mounted) {
-  //       Navigator.pop(context, 
-  //         'Status: ${result['overallStatus']}\n'
-  //         'Mode: ${result['captureMode']}\n'
-  //         'Fingers: ${(result['results'] as List).length}\n'
-  //         'Quality: $_qualityScore'
-  //       );
-  //     }
-  //   } catch (e) {
-  //     if (mounted) {
-  //       setState(() {
-  //         _capturing = false;
-  //         _guidance  = 'Please try again';
-  //       });
-  //       _startTimer();
-  //     }
-  //   }
-  // }
+  
 
   Future<void> _capture([Uint8List? existingBytes]) async {
     if (_capturing) return;
@@ -604,6 +572,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   Widget build(BuildContext context) {
+    const primaryYellow = Color(0xFFFFC107);
+    const lightYellow = Color(0xFFFFF8E1);
+    const darkYellow = Color(0xFFFFA000);
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -620,94 +591,163 @@ class _CameraScreenState extends State<CameraScreen> {
       ),
       body: Column(
         children: [
-
           // Camera Preview
           Expanded(
             child: _initialized
-                ? Stack(
-                    children: [
-                      // Camera
-                      SizedBox.expand(
-                        child: CameraPreview(_controller!),
-                      ),
+                // 🔥 NAYA FIX: LayoutBuilder ab Stack ke UPAR hai 🔥
+                ? LayoutBuilder(
+                    builder: (context, constraints) {
+                      // Screen ki width aur height yahan pehle hi nikal li
+                      final stackWidth = constraints.maxWidth;
+                      final stackHeight = constraints.maxHeight;
 
-                      // Overlay frame
-                      Center(
-                        child: Container(
-                          width: 250,
-                          height: 300,
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: _fingerDetected
-                                  ? Color(0xFFFFC107)
-                                  : Colors.white,
-                              width: 2,
-                            ),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                        ),
-                      ),
+                      return Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          // 1. Camera
+                          CameraPreview(_controller!),
 
-                      // Quality Badge
-                      Positioned(
-                        top: 16,
-                        left: 16,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: _qualityScore >= 70
-                                ? Color(0xFFFFC107)
-                                : Colors.orange,
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(
-                            'Quality: $_qualityScore%',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
-                            ),
-                          ),
-                        ),
-                      ),
-
-                      // Finger Count Badge
-                      if (_fingerDetected)
-                        Positioned(
-                          top: 16,
-                          right: 16,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 6,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Color(0xFFFFC107),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(
-                                  Icons.check_circle,
-                                  color: Colors.white,
-                                  size: 14,
+                          // 2. Central Static Box Overlay
+                          Center(
+                            child: Container(
+                              width: 250,
+                              height: 300,
+                              decoration: BoxDecoration(
+                                border: Border.all(
+                                  color: _fingerDetected ? primaryYellow : Colors.white24,
+                                  width: 1.5,
                                 ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  '$_fingerCount Finger${_fingerCount > 1 ? 's' : ''}',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 13,
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                          ),
+                           
+                          // 3. 🚀 GREEN BOXES LAYER 🚀
+                          ..._fingerBoxes.map((box) {
+                            try {
+                              final data = box as Map<dynamic, dynamic>;
+                              final label = data['label'] as String;
+                              
+                              // Safe Parsing
+                              double parseCoord(dynamic val) => (val is num) ? val.toDouble() : 0.0;
+                              
+                              final x1 = parseCoord(data['x1']);
+                              final y1 = parseCoord(data['y1']);
+                              final x2 = parseCoord(data['x2']);
+                              final y2 = parseCoord(data['y2']);
+
+                              final left = x1 * stackWidth;
+                              final top = y1 * stackHeight;
+                              final width = (x2 - x1) * stackWidth;
+                              final height = (y2 - y1) * stackHeight;
+
+                              if (width <= 0 || height <= 0 || left >= stackWidth || top >= stackHeight) {
+                                return const SizedBox.shrink();
+                              }
+
+                              // 🔥 AB POSITIONED DIRECTLY STACK KE ANDAR HAI 🔥
+                              return Positioned(
+                                left: left,
+                                top: top,
+                                width: width,
+                                height: height,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                      color: Colors.greenAccent, 
+                                      width: 2.5,
+                                    ),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Align(
+                                    alignment: Alignment.topCenter,
+                                    child: Container(
+                                      margin: const EdgeInsets.only(top: 2),
+                                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color: Colors.greenAccent,
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: Text(
+                                        label.replaceAll('_', ' '),
+                                        style: const TextStyle(
+                                          color: Colors.black,
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
                                   ),
                                 ),
-                              ],
+                              );
+                            } catch (e) {
+                              return const SizedBox.shrink(); 
+                            }
+                          }).toList(),
+                          // ──────────────────────────
+
+                          // 4. Quality Badge
+                          Positioned(
+                            top: 16,
+                            left: 16,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _qualityScore >= 70
+                                    ? primaryYellow
+                                    : Colors.orange,
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Text(
+                                'Quality: $_qualityScore%',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                    ],
+
+                          // 5. Finger Count Badge
+                          if (_fingerDetected)
+                            Positioned(
+                              top: 16,
+                              right: 16,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 6,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: primaryYellow,
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(
+                                      Icons.check_circle,
+                                      color: Colors.white,
+                                      size: 14,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      '$_fingerCount Finger${_fingerCount > 1 ? 's' : ''}',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                        ],
+                      );
+                    },
                   )
                 : const Center(
                     child: Column(
@@ -754,33 +794,40 @@ class _CameraScreenState extends State<CameraScreen> {
                   ),
 
                 // Guidance
+                // Guidance
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
+                    // 🔥 NAYA LOGIC: Agar guidance mein "Spoof" likha hai, toh RED color dikhao
                     Icon(
-                      _fingerDetected
-                          ? Icons.check_circle
-                          : Icons.info_outline,
-                      color: Colors.white,
-                      size: 18,
+                      _guidance.contains('Spoof') 
+                          ? Icons.warning_amber_rounded // Fraud ke liye Warning icon
+                          : (_fingerDetected ? Icons.check_circle : Icons.info_outline),
+                      color: _guidance.contains('Spoof') ? Colors.redAccent : Colors.white,
+                      size: 20,
                     ),
                     const SizedBox(width: 8),
-                    Text(
-                      _guidance,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w500,
+                    Expanded(
+                      child: Text(
+                        _guidance,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: _guidance.contains('Spoof') ? Colors.redAccent : Colors.white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold, // Text ko bold rakha hai
+                        ),
                       ),
                     ),
                   ],
                 ),
-                if (_detectedFingers.isNotEmpty) ...[
+
+             if (_detectedFingers.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   Text(
                     'Detecting: $_detectedFingers',
-                    style: const TextStyle(
-                      color: Colors.white70, // Thoda light color
+                    style: TextStyle(
+                      // Agar Spoof hai toh isko bhi Red kar do
+                      color: _guidance.contains('Spoof') ? Colors.redAccent.withOpacity(0.8) : Colors.white70, 
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
                     ),
@@ -981,12 +1028,18 @@ class ResultScreen extends StatelessWidget {
                     value: '${fingers.length}',
                   ),
                   const Divider(height: 16),
-                  _InfoRow(
-                    icon: Icons.security,
-                    label: 'Liveness Check',
-                    value: 'Passed ✓',
-                    valueColor: primaryYellow,
-                  ),
+              _InfoRow(
+    icon: Icons.security,
+    label: 'Liveness Check',
+    value: (fingers.isNotEmpty && 
+            fingers[0]['livenessPassed'] == true)
+        ? 'Passed ✓'
+        : 'Failed ✗',
+    valueColor: (fingers.isNotEmpty && 
+                 fingers[0]['livenessPassed'] == true)
+        ? Colors.green
+        : Colors.red,
+),
                 ],
               ),
             ),
@@ -1012,44 +1065,152 @@ class ResultScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 12),
-                  ...fingers.map((f) => Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Row(
+                  // ...fingers.map((f) => Padding(
+                  //   padding: const EdgeInsets.only(bottom: 8),
+                  //   child: Row(
+                  //     children: [
+                  //       const Icon(
+                  //         Icons.check_circle,
+                  //         color: primaryYellow,
+                  //         size: 18,
+                  //       ),
+                  //       const SizedBox(width: 8),
+                  //       Text(
+                  //         (f['fingerId'] as String)
+                  //             .replaceAll('_', ' '),
+                  //         style: const TextStyle(
+                  //           fontSize: 13,
+                  //         ),
+                  //       ),
+                        
+                  //       const Spacer(),
+                  //       // 🔥 NAYA BADGE: ISO Template Ready 🔥
+                  //       if ((f['template'] as String).isNotEmpty)
+                  //         Container(
+                  //           margin: const EdgeInsets.only(right: 8),
+                  //           padding: const EdgeInsets.symmetric(
+                  //             horizontal: 6, vertical: 2,
+                  //           ),
+                  //           decoration: BoxDecoration(
+                  //             color: Colors.blue[50],
+                  //             borderRadius: BorderRadius.circular(6),
+                  //             border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                  //           ),
+                  //           child: const Text(
+                  //             'ISO Ready ✓',
+                  //             style: TextStyle(
+                  //               color: Colors.blue,
+                  //               fontSize: 10,
+                  //               fontWeight: FontWeight.bold,
+                  //             ),
+                  //           ),
+                  //         ),
+
+                  //       // Purana Quality Score Badge
+                  //       Container(
+                  //         padding: const EdgeInsets.symmetric(
+                  //           horizontal: 8, vertical: 2,
+                  //         ),
+                  //         decoration: BoxDecoration(
+                  //           color: Colors.green[50],
+                  //           borderRadius: BorderRadius.circular(10),
+                  //         ),
+                  //         child: Text(
+                  //           'Q: ${f['qualityScore']}',
+                  //           style: const TextStyle(
+                  //             color: primaryYellow,
+                  //             fontSize: 12,
+                  //             fontWeight: FontWeight.bold,
+                  //           ),
+                  //         ),
+                  //       ),
+                  //     ],
+                  //   ),
+                  // )
+                  // ),
+                    ...fingers.map((f) => Padding(
+                    padding: const EdgeInsets.only(bottom: 12), // Thodi spacing badha di
+                    child: Column( // 🔥 ROW KO COLUMN MEIN DAAL DIYA 🔥
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Icon(
-                          Icons.check_circle,
-                          color: primaryYellow,
-                          size: 18,
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          (f['fingerId'] as String)
-                              .replaceAll('_', ' '),
-                          style: const TextStyle(
-                            fontSize: 13,
-                          ),
-                        ),
-                        const Spacer(),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.green[50],
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Text(
-                            'Q: ${f['qualityScore']}',
-                            style: const TextStyle(
+                        Row(
+                          children: [
+                            const Icon(
+                              Icons.check_circle,
                               color: primaryYellow,
-                              fontSize: 12,
-                              fontWeight: FontWeight.bold,
+                              size: 18,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              (f['fingerId'] as String).replaceAll('_', ' '),
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const Spacer(),
+                            
+                            // 🔥 ISO Ready Badge 🔥
+                            if ((f['template'] as String).isNotEmpty)
+                              Container(
+                                margin: const EdgeInsets.only(right: 8),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.blue[50],
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                                ),
+                                child: const Text(
+                                  'ISO Ready ✓',
+                                  style: TextStyle(
+                                    color: Colors.blue,
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+
+                            // Quality Score
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8, vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.green[50],
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                'Q: ${f['qualityScore']}',
+                                style: const TextStyle(
+                                  color: primaryYellow,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        
+                        // 🚀 YAHAN TEMPLATE KI VALUE PRINT HOGI 🚀
+                        if ((f['template'] as String).isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 26, top: 4), // Icon ke theek neeche align karne ke liye
+                            child: Text(
+                              // Sirf shuru ke 30 characters dikha rahe hain taaki UI na bigde
+                              'Template Data: ${(f['template'] as String).length > 30 ? (f['template'] as String).substring(0, 30) + '...' : f['template']}',
+                              style: const TextStyle(
+                                color: Colors.grey,
+                                fontSize: 10,
+                                fontFamily: 'monospace', // Code jaisa font
+                              ),
                             ),
                           ),
-                        ),
                       ],
                     ),
                   )),
+
                 ],
               ),
             ),
