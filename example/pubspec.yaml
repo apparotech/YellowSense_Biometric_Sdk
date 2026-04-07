@@ -30,6 +30,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   camera: ^0.10.5+9
   permission_handler: ^11.0.0
+  image: ^4.8.0
 
 dev_dependencies:
   integration_test:
